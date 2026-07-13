@@ -1420,6 +1420,76 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    ):
+        # _vllm_v4_deepseek_cutlass_weight_convert:
+        # Adapt DeepSeek-V4 contiguous [gate, up] MXFP4 weights to the
+        # FlashInfer CUTLASS fused-MoE layout.
+        w13_w = w13_weight.data
+        w1_w, w3_w = torch.chunk(w13_w, 2, dim=1)
+        w13_weight_swapped = torch.cat([w3_w, w1_w], dim=1)
+
+        w13_bias_swapped = None
+        if w13_bias is not None:
+            w13_b = w13_bias.data.to(torch.float32)
+            b1, b3 = torch.chunk(w13_b, 2, dim=-1)
+            w13_bias_swapped = torch.cat([b3, b1], dim=-1).to(torch.bfloat16)
+
+        w13_s = w13_weight_scale.data
+        s1, s3 = torch.chunk(w13_s, 2, dim=1)
+        w13_scale_swapped = torch.cat([s3, s1], dim=1)
+
+        if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+            from flashinfer import block_scale_interleave
+
+            orig_shape = w13_scale_swapped.shape
+            w13_scale_interleaved = block_scale_interleave(
+                w13_scale_swapped.view(torch.uint8)
+            ).reshape(orig_shape)
+
+            w2_s = w2_weight_scale.data
+            orig_shape = w2_s.shape
+            w2_scale_interleaved = block_scale_interleave(
+                w2_s.view(torch.uint8)
+            ).reshape(orig_shape)
+
+            return (
+                w13_weight_swapped,
+                w2_weight,
+                w13_scale_interleaved,
+                w2_scale_interleaved,
+                w13_bias_swapped,
+                w2_bias,
+            )
+
+        assert mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16
+
+        def _interleave_mxfp4_cutlass_sm90(w):
+            w_shape = w.shape
+            w_interleaved = w.reshape(w_shape[0], w_shape[1], (w_shape[2] // 4), 4)
+            w_interleaved = w_interleaved.permute(0, 2, 1, 3)
+            w_interleaved = w_interleaved.reshape(
+                w_shape[0], w_shape[2] // 4, w_shape[1] * 4
+            )
+            return w_interleaved
+
+        w31_scales = w13_scale_swapped.to(torch.uint8)
+        w31_scales_interleaved = _interleave_mxfp4_cutlass_sm90(w31_scales)
+
+        w2_scale = w2_weight_scale.data.to(torch.uint8)
+        w2_scale_interleaved = _interleave_mxfp4_cutlass_sm90(w2_scale)
+
+        return (
+            w13_weight_swapped,
+            w2_weight,
+            w31_scales_interleaved,
+            w2_scale_interleaved,
+            w13_bias_swapped,
+            w2_bias,
+        )
+
     elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
         from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401
 

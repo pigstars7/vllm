@@ -260,6 +260,9 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
     SparseMLAAttentionImpl,
 )
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.mla.prefill import (
     MLAPrefillBackend,
     get_mla_prefill_backend,
@@ -1539,6 +1542,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 f"SINGLE_ONLY, got {self.reorder_batch_threshold}"
             )
 
+        self.compress_ratio = getattr(self.kv_cache_spec, "compress_ratio", 1)
+        if self.compress_ratio > 1:
+            # _vllm_v4_mla_common_compressed_slot_mapping:
+            # DeepSeek-V4 main MLA cache uses compressed token slots.
+            self.compressed_slot_mapping_buffer = torch.empty(
+                (vllm_config.scheduler_config.max_num_batched_tokens,),
+                dtype=torch.int64,
+                device=device,
+            )
+
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
@@ -1589,6 +1602,18 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         device = self.device
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+
+        query_start_loc = common_attn_metadata.query_start_loc
+        if self.compress_ratio > 1:
+            slot_mapping = get_compressed_slot_mapping(
+                num_tokens,
+                query_start_loc,
+                common_attn_metadata.seq_lens,
+                block_table_tensor,
+                self.kv_cache_spec.storage_block_size,
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
 
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu

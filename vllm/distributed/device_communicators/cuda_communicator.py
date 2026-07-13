@@ -62,9 +62,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
-        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-            FlashInferAllReduce,
-        )
+        # _vllm_v4_lazy_flashinfer_allreduce_import:
+        # Only import FlashInfer allreduce when the backend is enabled.
+        FlashInferAllReduce = None
+        if use_flashinfer_allreduce:
+            from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+                FlashInferAllReduce,
+            )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -92,6 +96,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
         if self.use_flashinfer_allreduce and self.world_size > 1:
+            assert FlashInferAllReduce is not None
             self.fi_ar_comm = FlashInferAllReduce(
                 group=self.cpu_group,
                 device=self.device,

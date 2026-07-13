@@ -4384,7 +4384,22 @@ class GPUModelRunner(
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                if (
+                    getattr(self, "_vllm_v4_skip_next_pp_sample_receive", False)
+                    or (
+                        __import__("os").environ.get("ROLE_NAME") == "prefill"
+                        and __import__("os").environ.get("VLLM_DSV4_SKIP_PP_SAMPLE_BROADCAST_FOR_CHUNKED_PREFILL") == "1"
+                    )
+                ):
+                    # _vllm_v4_skip_pp_sample_broadcast_for_chunked_prefill_v3:
+                    # The previous chunked-prefill step intentionally skipped
+                    # dummy-token sampling/broadcast. Prefill producer steps
+                    # export KV only and do not consume sampled tokens on
+                    # non-last PP ranks; do not wait for a broadcast.
+                    self._vllm_v4_skip_next_pp_sample_receive = False
+                    self.input_batch.prev_sampled_token_ids = None
+                else:
+                    self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -4404,6 +4419,36 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if (
+            self.use_async_scheduling
+            and get_pp_group().world_size > 1
+            and (
+                self._is_all_reqs_chunked_prefill()
+                or (
+                    __import__("os").environ.get("VLLM_DSV4_SKIP_PREFILL_PRODUCER_SAMPLING") == "1"
+                    and __import__("os").environ.get("ROLE_NAME") == "prefill"
+                )
+            )
+        ):
+            # _vllm_v4_skip_pp_sample_broadcast_for_chunked_prefill_v3:
+            # Prefill producer exports KV; sampled token ids are not consumed
+            # by the decode stage. Keep the branch rank-consistent by using
+            # only role/static env state, not per-rank kv_connector_output.
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
+            self._vllm_v4_skip_next_pp_sample_receive = True
+            self.input_batch.prev_sampled_token_ids = None
+            return ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids.copy(),
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[[] for _ in self.input_batch.req_ids],
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output
+                if self.supports_mm_inputs
+                else None,
+                cudagraph_stats=cudagraph_stats,
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4647,23 +4692,36 @@ class GPUModelRunner(
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-        # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
+        # Skip for chunked prefill and for PD prefill producers: sampled
+        # tokens are dummy and will be discarded; decode consumes exported KV.
+        if (
+            not self._is_all_reqs_chunked_prefill()
+            and not (
+                __import__("os").environ.get("ROLE_NAME") == "prefill"
+                and __import__("os").environ.get("VLLM_DSV4_SKIP_PP_SAMPLE_BROADCAST_FOR_CHUNKED_PREFILL") == "1"
+            )
+        ):
             torch.distributed.broadcast(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
-        """Receive sampled token ids broadcast from last PP stage"""
+        """Receive sampled token ids broadcast from last PP rank"""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
+        if self._is_all_reqs_chunked_prefill():
+            # _vllm_v4_skip_pp_sample_broadcast_for_chunked_prefill_v3:
+            # Do not even allocate the sampled-token receive buffer for
+            # intermediate chunked-prefill steps. Allocation can surface a
+            # prior async CUDA error and the buffer is not consumed because
+            # sampled tokens are discarded for these steps.
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.prev_req_id_to_index = {}
+            return
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`

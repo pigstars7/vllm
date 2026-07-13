@@ -129,6 +129,10 @@ class DeepseekV4MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        if getattr(self.down_proj, "disable_tp", False):  # vllm-v4-hotfix shared-expert zero-nonzero-rank
+            from vllm.distributed import get_tensor_model_parallel_rank as _tp_rank
+            if _tp_rank() != 0:
+                x = x * 0.0
         return x
 
 
@@ -981,6 +985,7 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
+                is_sequence_parallel=True,  # vllm-v4-hotfix shared-expert TP1
                 prefix=f"{prefix}.shared_experts",
             )
 

@@ -617,13 +617,14 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
-    if dcp != 1 or pcp != 1:
-        raise ValueError(
-            "Hybrid KV cache groups with multiple block sizes do not "
-            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
-        )
-
-    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    # _vllm_v4_allow_hybrid_kv_dcp: hybrid KV can use context parallelism
+    # if scheduler/block-table granularity is promoted to the effective local
+    # manager block size. Keep hash_block_size at the raw group granularity so
+    # BlockHashListWithBlockSize can compose effective-block hashes for prefix
+    # cache and P/D connector metadata.
+    cp_world_size = dcp * pcp
+    raw_group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    group_block_sizes = [bs * cp_world_size for bs in raw_group_block_sizes]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
@@ -645,7 +646,7 @@ def resolve_kv_cache_block_sizes(
 
     requested = cache_config.hash_block_size
     hash_block_size = (
-        requested if requested is not None else math.gcd(*group_block_sizes)
+        requested if requested is not None else math.gcd(*raw_group_block_sizes)
     )
     if any(bs % hash_block_size != 0 for bs in group_block_sizes):
         raise ValueError(

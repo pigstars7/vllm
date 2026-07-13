@@ -38,6 +38,9 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -197,6 +200,15 @@ class FlashInferMLASparseMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
+        self.compress_ratio = getattr(self.kv_cache_spec, "compress_ratio", 1)
+        if self.compress_ratio > 1:
+            # _vllm_v4_sparse_mla_compressed_slot_mapping:
+            # Main sparse MLA KV cache stores compressed tokens.
+            self.compressed_slot_mapping_buffer = torch.empty(
+                (vllm_config.scheduler_config.max_num_batched_tokens,),
+                dtype=torch.int64,
+                device=device,
+            )
 
     def build(
         self,
@@ -221,13 +233,25 @@ class FlashInferMLASparseMetadataBuilder(
         )
         req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
 
+        slot_mapping = cm.slot_mapping
+        if self.compress_ratio > 1:
+            slot_mapping = get_compressed_slot_mapping(
+                num_tokens,
+                cm.query_start_loc,
+                cm.seq_lens,
+                cm.block_table_tensor,
+                self.kv_cache_spec.storage_block_size,
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
+
         return FlashInferMLASparseMetadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
             max_seq_len=cm.max_seq_len,
             num_actual_tokens=cm.num_actual_tokens,
             query_start_loc=cm.query_start_loc,
-            slot_mapping=cm.slot_mapping,
+            slot_mapping=slot_mapping,
             block_table=cm.block_table_tensor,
             req_id_per_token=req_id_per_token_tensor,
             seq_lens=cm.seq_lens,

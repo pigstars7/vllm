@@ -319,11 +319,18 @@ class SingleTypeKVCacheManager(ABC):
         if num_cached_blocks >= num_full_blocks:
             return
 
+        mask_kv_cache_spec = self.kv_cache_spec
+        if self.block_size != self.kv_cache_spec.block_size:
+            # _vllm_v4_allow_hybrid_kv_dcp: sparse SWA cache masks operate over
+            # manager blocks, which are CP-scaled, not raw spec blocks.
+            mask_kv_cache_spec = self.kv_cache_spec.copy_with_new_block_size(
+                self.block_size
+            )
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
             alignment_tokens=self.scheduler_block_size,
-            kv_cache_spec=self.kv_cache_spec,
+            kv_cache_spec=mask_kv_cache_spec,
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
             num_prompt_tokens=request.num_prompt_tokens,
@@ -613,12 +620,15 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        block_size = kv_cache_spec.block_size
+        if dcp_world_size * pcp_world_size > 1:
+            # _vllm_v4_allow_hybrid_kv_dcp: one manager block represents the
+            # CP-wide logical span, matching SingleTypeKVCacheManager.__init__.
+            block_size *= dcp_world_size * pcp_world_size
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
+            kv_cache_spec.sliding_window, block_size, drop_eagle_block
         )
 
         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
@@ -626,12 +636,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
+        max_num_blocks = max_length // block_size
         computed_blocks = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
-        block_size = kv_cache_spec.block_size
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
@@ -1336,12 +1345,18 @@ def get_manager_for_kv_cache_spec(
     # chunks; the runtime admission cap must match the recycling-aware bound
     # the startup pool sizer uses (single source of truth: the spec method).
     if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
-        kwargs["max_admission_blocks_per_request"] = (
-            kv_cache_spec.max_admission_blocks_per_request(
-                max_num_batched_tokens=max_num_batched_tokens,
-                max_model_len=max_model_len,
-            )
+        max_admission_blocks = kv_cache_spec.max_admission_blocks_per_request(
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
         )
+        cp_world_size = kwargs.get("dcp_world_size", 1) * kwargs.get(
+            "pcp_world_size", 1
+        )
+        if cp_world_size > 1:
+            # _vllm_v4_allow_hybrid_kv_dcp: admission caps are manager-block
+            # counts, so scale the raw spec-token cap down for local CP shards.
+            max_admission_blocks = cdiv(max_admission_blocks, cp_world_size)
+        kwargs["max_admission_blocks_per_request"] = max_admission_blocks
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
 

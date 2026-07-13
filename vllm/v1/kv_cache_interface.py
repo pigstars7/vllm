@@ -508,14 +508,20 @@ class SlidingWindowSpec(AttentionSpec):
         return cdiv(num_tokens, self.block_size) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
+        # _vllm_v4_allow_hybrid_kv_dcp: each CP rank stores only its local
+        # shard of the sliding-window KV blocks. FullAttentionSpec already
+        # accounts for DCP/PCP; mirror that accounting for hybrid SWA groups.
+        cp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
         )
         max_model_len = vllm_config.model_config.max_model_len
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_blocks = self.max_admission_blocks_per_request(
             max_num_batched_tokens=max_num_batched_tokens, max_model_len=max_model_len
         )
+        if cp_world_size > 1:
+            max_blocks = cdiv(max_blocks, cp_world_size)
         return max_blocks * self.page_size_bytes
 
     def is_uniform_with_collection(

@@ -501,13 +501,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
+        # _vllm_v4_allow_hybrid_kv_dcp: the effective manager block size is
+        # raw_spec.block_size * DCP * PCP, matching SingleTypeKVCacheManager.
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+        self.cp_world_size = dcp_world_size * pcp_world_size
         assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0
+            (g.kv_cache_spec.block_size * self.cp_world_size) % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
-        ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
-        assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        ), "effective block_size must be divisible by hash_block_size"
         self.verify_and_split_kv_cache_groups()
+
+    def _effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
+        return kv_cache_spec.block_size * self.cp_world_size
 
     def verify_and_split_kv_cache_groups(self) -> None:
         """
@@ -603,10 +609,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
+            effective_block_size = self._effective_block_size(kv_cache_spec)
+            if effective_block_size == self.hash_block_size:
                 return block_hashes
             return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                block_hashes, self.hash_block_size, effective_block_size
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -636,8 +643,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # Full attention is downward-closed: we only need to look
                     # up cached blocks once; on subsequent iterations just trim
                     # to the (reduced) current hit length.
+                    effective_block_size = self._effective_block_size(spec)
                     curr_hit_length = (
-                        curr_hit_length // spec.block_size * spec.block_size
+                        curr_hit_length // effective_block_size * effective_block_size
                     )
                     continue
 
@@ -647,7 +655,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if drop_eagle_block:
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
-                        curr_hit_length + spec.block_size, max_cache_hit_length
+                        curr_hit_length + self._effective_block_size(spec),
+                        max_cache_hit_length,
                     )
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
@@ -657,8 +666,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,
+                    dcp_world_size=self.dcp_world_size,
+                    pcp_world_size=self.pcp_world_size,
                 )
-                _new_hit_length = len(hit_blocks[0]) * spec.block_size
+                _new_hit_length = (
+                    len(hit_blocks[0]) * self._effective_block_size(spec)
+                )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -679,7 +692,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Truncate full attention blocks to final hit_length (if present)
         first_group = self.attention_groups[0]
         if isinstance(first_group.spec, FullAttentionSpec):
-            num_blocks = hit_length // first_group.spec.block_size
+            num_blocks = hit_length // self._effective_block_size(first_group.spec)
             for group_id in first_group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]

@@ -22,12 +22,10 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     make_moe_prepare_and_finalize_naive_dp_ep,
     make_moe_prepare_and_finalize_no_dp_ep,
 )
-from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_one_sided import (  # noqa: E501
-    FlashInferNVLinkOneSidedPrepareAndFinalize,
-)
-from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two_sided import (  # noqa: E501
-    FlashInferNVLinkTwoSidedPrepareAndFinalize,
-)
+# _vllm_v4_lazy_flashinfer_nvlink_imports:
+# Defer FlashInfer NVLink imports until their backend is actually selected.
+# This avoids importing unrelated FlashInfer/CUTLASS Python DSL code paths
+# during DeepEP/NIXL deployments.
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import (
     has_deep_ep,
@@ -275,12 +273,18 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_fi_nvl_two_sided_kernels:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two_sided import (  # noqa: E501
+            FlashInferNVLinkTwoSidedPrepareAndFinalize,
+        )
         assert quant_config is not None
         prepare_finalize = FlashInferNVLinkTwoSidedPrepareAndFinalize(
             num_dispatchers=all2all_manager.world_size,
         )
 
     elif moe.use_fi_nvl_one_sided_kernels:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_one_sided import (  # noqa: E501
+            FlashInferNVLinkOneSidedPrepareAndFinalize,
+        )
         assert quant_config is not None
         max_num_tokens = (
             get_current_vllm_config().scheduler_config.max_num_batched_tokens

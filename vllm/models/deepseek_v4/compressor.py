@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+import os
 from typing import Any, ClassVar, cast
 
 import torch
@@ -14,6 +15,9 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
+)
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
@@ -32,6 +36,211 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+
+def _vllm_v4_minmax(t: torch.Tensor | None) -> tuple[int | None, int | None]:
+    if t is None or t.numel() == 0:
+        return None, None
+    return int(t.min().item()), int(t.max().item())
+
+
+def _vllm_v4_kv_block_table_from_metadata(k_cache_metadata: Any) -> torch.Tensor | None:
+    for container in (
+        getattr(k_cache_metadata, "prefill", None),
+        getattr(k_cache_metadata, "decode", None),
+        k_cache_metadata,
+    ):
+        if container is None:
+            continue
+        block_table = getattr(container, "block_table", None)
+        if block_table is not None:
+            return block_table
+        block_table = getattr(container, "block_table_tensor", None)
+        if block_table is not None:
+            return block_table
+    return None
+
+
+def _vllm_v4_rebuild_compressed_kv_slot_mapping_torch(
+    module: nn.Module,
+    *,
+    positions: torch.Tensor,
+    token_to_req_indices: torch.Tensor | None,
+    k_cache_metadata: Any,
+    kv_cache: torch.Tensor,
+    num_actual: int,
+) -> torch.Tensor:
+    # _vllm_v4_compressor_torch_rebuild_kv_slot_mapping:
+    # Rebuild the final MLA KV-cache slot mapping without calling the Triton
+    # helper. The helper uses the right formula, but in packed long-prefill
+    # cases it hit IMA inside its own block-table load. The fused compressor
+    # still needs a sane compressed mapping immediately before writing KV.
+    current = getattr(k_cache_metadata, "slot_mapping", None)
+    fallback = (
+        current[:num_actual].clone()
+        if current is not None
+        else torch.full((num_actual,), -1, dtype=torch.int64, device=positions.device)
+    )
+    if num_actual == 0:
+        return fallback
+
+    prefix = getattr(module, "prefix", module.__class__.__name__)
+    block_table = _vllm_v4_kv_block_table_from_metadata(k_cache_metadata)
+    kv_block_size = int(kv_cache.shape[1]) if kv_cache.dim() > 1 else 0
+    compress_ratio = int(getattr(module, "compress_ratio", 1))
+    logical_block_size = kv_block_size * compress_ratio
+    if block_table is None or block_table.dim() < 2 or kv_block_size <= 0:
+        if os.environ.get("VLLM_DSV4_COMPRESSOR_BOUNDARY_DIAG") == "1":
+            print(
+                "[vllm-v4-compressor-rebuild] "
+                f"pid={os.getpid()} prefix={prefix} fallback_missing_metadata "
+                f"block_table_shape={None if block_table is None else tuple(block_table.shape)} "
+                f"kv_block_size={kv_block_size}",
+                flush=True,
+            )
+        return fallback
+
+    block_table = block_table.to(device=positions.device)
+    positions_i64 = positions[:num_actual].to(torch.long)
+    if token_to_req_indices is None:
+        req_indices = torch.zeros((num_actual,), dtype=torch.long, device=positions.device)
+    else:
+        req_indices = token_to_req_indices[:num_actual].to(
+            device=positions.device, dtype=torch.long
+        )
+
+    compressed_pos = positions_i64 // compress_ratio
+    # The block table is indexed by the semantic/original KV block size
+    # (for DeepSeek-V4 C4: 256 tokens), while the physical cache stores
+    # compressed slots with storage_block_size=64.
+    block_ids = positions_i64 // logical_block_size
+    valid = (
+        (positions_i64 >= 0)
+        & (((positions_i64 + 1) % compress_ratio) == 0)
+        & (req_indices >= 0)
+        & (req_indices < int(block_table.shape[0]))
+        & (block_ids >= 0)
+        & (block_ids < int(block_table.shape[1]))
+    )
+    safe_req = req_indices.clamp(min=0, max=int(block_table.shape[0]) - 1)
+    safe_block = block_ids.clamp(min=0, max=int(block_table.shape[1]) - 1)
+    block_numbers = block_table[safe_req, safe_block].to(torch.long)
+    slot_ids = block_numbers * kv_block_size + (compressed_pos % kv_block_size)
+    valid = valid & (block_numbers >= 0)
+    rebuilt = torch.where(
+        valid,
+        slot_ids,
+        torch.full_like(slot_ids, -1),
+    )
+
+    if (
+        os.environ.get("VLLM_DSV4_COMPRESSOR_BOUNDARY_DIAG") == "1"
+        and "model.layers.16" in prefix
+    ):
+        rb_min, rb_max = _vllm_v4_minmax(rebuilt)
+        cur_min, cur_max = _vllm_v4_minmax(current)
+        print(
+            "[vllm-v4-compressor-rebuild] "
+            f"pid={os.getpid()} prefix={prefix} "
+            f"num_actual={num_actual} kv_block_size={kv_block_size} "
+            f"logical_block_size={logical_block_size} "
+            f"block_table_shape={tuple(block_table.shape)} "
+            f"current_minmax=({cur_min},{cur_max}) rebuilt_minmax=({rb_min},{rb_max})",
+            flush=True,
+        )
+    elif os.environ.get("VLLM_DSV4_COMPRESSOR_REBUILD_WARN") == "1":
+        rb_min, rb_max = _vllm_v4_minmax(rebuilt)
+        cur_min, cur_max = _vllm_v4_minmax(current)
+        should_warn = (
+            (cur_min is not None and cur_min < -1)
+            or (cur_max is not None and cur_max >= int(kv_cache.shape[0]) * kv_block_size)
+            or (rb_min == -1 and rb_max == -1 and int((positions_i64 >= 0).sum().item()) > 0)
+        )
+        if should_warn:
+            print(
+                "[vllm-v4-compressor-rebuild-warn] "
+                f"pid={os.getpid()} prefix={prefix} "
+                f"compress_ratio={compress_ratio} num_actual={num_actual} "
+                f"kv_block_size={kv_block_size} logical_block_size={logical_block_size} "
+                f"block_table_shape={tuple(block_table.shape)} "
+                f"positions_minmax={_vllm_v4_minmax(positions[:num_actual])} "
+                f"req_minmax={_vllm_v4_minmax(token_to_req_indices)} "
+                f"current_minmax=({cur_min},{cur_max}) rebuilt_minmax=({rb_min},{rb_max})",
+                flush=True,
+            )
+    return rebuilt
+
+
+def _vllm_v4_compressor_boundary_diag(
+    module: nn.Module,
+    *,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    token_to_req_indices: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    state_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_metadata: Any,
+    num_actual: int,
+) -> None:
+    # _vllm_v4_compressor_boundary_diag: metadata bounds before compressed KV write.
+    if os.environ.get("VLLM_DSV4_COMPRESSOR_BOUNDARY_DIAG") != "1":
+        return
+    prefix = getattr(module, "prefix", module.__class__.__name__)
+    # Keep logs narrow: the crash is the second chunk and layer16, but printing
+    # layer16 first chunk is still useful as a known-good comparator.
+    if "model.layers.16" not in prefix and int(positions.shape[0]) == 4096:
+        return
+
+    try:
+        kv_slot_mapping = getattr(k_cache_metadata, "slot_mapping", None)
+        pos_min, pos_max = _vllm_v4_minmax(positions)
+        slot_min, slot_max = _vllm_v4_minmax(slot_mapping)
+        kv_slot_min, kv_slot_max = _vllm_v4_minmax(kv_slot_mapping)
+        req_min, req_max = _vllm_v4_minmax(token_to_req_indices)
+        bt_min, bt_max = _vllm_v4_minmax(block_table)
+
+        actual_positions = positions[:num_actual]
+        boundary = (actual_positions + 1) % getattr(module, "compress_ratio", 1) == 0
+        boundary_count = int(boundary.sum().item())
+        if boundary_count:
+            boundary_indices = torch.nonzero(boundary, as_tuple=False).flatten()
+            boundary_idx_min = int(boundary_indices.min().item())
+            boundary_idx_max = int(boundary_indices.max().item())
+        else:
+            boundary_idx_min = boundary_idx_max = None
+
+        state_total_slots = int(state_cache.shape[0]) * int(block_size)
+        kv_cache_block_size = int(kv_cache.shape[1]) if kv_cache.dim() > 1 else None
+        kv_total_slots = (
+            int(kv_cache.shape[0]) * kv_cache_block_size
+            if kv_cache_block_size is not None
+            else None
+        )
+        print(
+            "[vllm-v4-compressor-diag] "
+            f"pid={os.getpid()} prefix={prefix} "
+            f"compress_ratio={getattr(module, 'compress_ratio', None)} "
+            f"num_actual={num_actual} positions_shape={tuple(positions.shape)} "
+            f"positions_minmax=({pos_min},{pos_max}) "
+            f"slot_shape={tuple(slot_mapping.shape)} slot_minmax=({slot_min},{slot_max}) "
+            f"state_cache_shape={tuple(state_cache.shape)} state_total_slots={state_total_slots} "
+            f"kv_slot_shape={None if kv_slot_mapping is None else tuple(kv_slot_mapping.shape)} "
+            f"kv_slot_minmax=({kv_slot_min},{kv_slot_max}) "
+            f"kv_cache_shape={tuple(kv_cache.shape)} kv_total_slots={kv_total_slots} "
+            f"block_table_shape={tuple(block_table.shape)} block_table_minmax=({bt_min},{bt_max}) "
+            f"block_size={block_size} req_minmax=({req_min},{req_max}) "
+            f"boundary_count={boundary_count} boundary_idx_minmax=({boundary_idx_min},{boundary_idx_max})",
+            flush=True,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception as exc:
+        print(
+            f"[vllm-v4-compressor-diag] pid={os.getpid()} prefix={prefix} diag_error={exc!r}",
+            flush=True,
+        )
 
 
 class CompressorBackend(AttentionBackend):
@@ -340,6 +549,38 @@ class DeepseekCompressor(nn.Module):
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
 
+        if (
+            os.environ.get("VLLM_DSV4_COMPRESSOR_REBUILD_KV_SLOT_MAPPING") == "1"
+            and self.compress_ratio > 1
+            and ".indexer." not in self.prefix
+        ):
+            # _vllm_v4_compressor_rebuild_kv_slot_mapping:
+            # The backend metadata may share a compressed slot_mapping buffer
+            # that is later overwritten by another layer/group before this
+            # compressor runs. Rebuild the final MLA KV-cache mapping with
+            # torch from the current positions and the final KV block table.
+            k_cache_metadata.slot_mapping = _vllm_v4_rebuild_compressed_kv_slot_mapping_torch(
+                self,
+                positions=positions,
+                token_to_req_indices=token_to_req_indices,
+                k_cache_metadata=k_cache_metadata,
+                kv_cache=kv_cache,
+                num_actual=num_actual,
+            )
+
+        _vllm_v4_compressor_boundary_diag(
+            self,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            token_to_req_indices=token_to_req_indices,
+            block_table=block_table,
+            block_size=block_size,
+            state_cache=state_cache,
+            kv_cache=kv_cache,
+            k_cache_metadata=k_cache_metadata,
+            num_actual=num_actual,
+        )
+
         # FlashInfer V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # legacy FlashMLA path uses the UE8M0 paged uint8 layout.
         store_full_kv = self.head_dim == 512 and kv_cache.dtype != torch.uint8
@@ -353,7 +594,9 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (current_platform.is_cuda() and self.head_dim == 512
+                and __import__("os").environ.get(
+                    "VLLM_DSV4_DISABLE_CUTEDSL_INDEXER") != "1"):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
